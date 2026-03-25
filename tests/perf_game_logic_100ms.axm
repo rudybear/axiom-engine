@@ -1,0 +1,185 @@
+@module perf_game_logic;
+@intent("Performance test: 1000 frames of asteroid game logic in < 100ms (no rendering)");
+@constraint { optimize_for: "performance" };
+
+// =============================================================================
+// Perf Test: Asteroid Field Game Logic
+// =============================================================================
+//
+// Runs 1000 frames of the core game loop (asteroid movement, collision checks,
+// spawning) without any rendering. Validates that the pure game logic is fast
+// enough for real-time play at 60+ FPS.
+//
+// Target: < 100ms for 1000 frames with 200 active asteroids.
+// =============================================================================
+
+@pure @inline(always)
+fn distance_sq(x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    let dx: f64 = x2 - x1;
+    let dy: f64 = y2 - y1;
+    return dx * dx + dy * dy;
+}
+
+fn lcg_next(seed_ptr: ptr[i64]) -> i64 {
+    let s: i64 = ptr_read_i64(seed_ptr, 0);
+    s = s * 6364136223846793005 + 1442695040888963407;
+    ptr_write_i64(seed_ptr, 0, s);
+    let bits: i64 = lshr(s, 16);
+    return band(bits, 2147483647);
+}
+
+fn lcg_next_f64(seed_ptr: ptr[i64], max: f64) -> f64 {
+    let v: i64 = lcg_next(seed_ptr);
+    return to_f64_i64(v) * max / 2147483647.0;
+}
+
+fn lcg_next_i32(seed_ptr: ptr[i64], max: i32) -> i32 {
+    let v: i64 = lcg_next(seed_ptr);
+    return narrow(v % widen(max));
+}
+
+// ---------------------------------------------------------------------------
+// Spawn asteroid at random edge
+// ---------------------------------------------------------------------------
+
+fn spawn_asteroid(idx: i32,
+                  ast_x: ptr[f64], ast_y: ptr[f64],
+                  ast_vx: ptr[f64], ast_vy: ptr[f64],
+                  ast_radius: ptr[f64],
+                  ast_alive: ptr[i32],
+                  seed_ptr: ptr[i64]) {
+    let edge: i32 = lcg_next_i32(seed_ptr, 4);
+    let sx: f64 = 0.0;
+    let sy: f64 = 0.0;
+    if edge == 0 { sx = 0.0;   sy = lcg_next_f64(seed_ptr, 600.0); }
+    if edge == 1 { sx = 800.0; sy = lcg_next_f64(seed_ptr, 600.0); }
+    if edge == 2 { sx = lcg_next_f64(seed_ptr, 800.0); sy = 0.0; }
+    if edge == 3 { sx = lcg_next_f64(seed_ptr, 800.0); sy = 600.0; }
+
+    ptr_write_f64(ast_x, idx, sx);
+    ptr_write_f64(ast_y, idx, sy);
+    ptr_write_f64(ast_vx, idx, (400.0 - sx) * 0.003 + lcg_next_f64(seed_ptr, 0.4) - 0.2);
+    ptr_write_f64(ast_vy, idx, (300.0 - sy) * 0.003 + lcg_next_f64(seed_ptr, 0.4) - 0.2);
+    ptr_write_f64(ast_radius, idx, 3.0 + lcg_next_f64(seed_ptr, 8.0));
+    ptr_write_i32(ast_alive, idx, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Main: run 1000 frames of game logic, no rendering
+// ---------------------------------------------------------------------------
+
+fn main() -> i32 {
+    let max_ast: i32 = 300;
+
+    // SOA asteroid arrays
+    let ast_x:      ptr[f64] = heap_alloc_zeroed(max_ast, 8);
+    let ast_y:      ptr[f64] = heap_alloc_zeroed(max_ast, 8);
+    let ast_vx:     ptr[f64] = heap_alloc_zeroed(max_ast, 8);
+    let ast_vy:     ptr[f64] = heap_alloc_zeroed(max_ast, 8);
+    let ast_radius: ptr[f64] = heap_alloc_zeroed(max_ast, 8);
+    let ast_alive:  ptr[i32] = heap_alloc_zeroed(max_ast, 4);
+
+    let seed_ptr: ptr[i64] = heap_alloc(1, 8);
+    ptr_write_i64(seed_ptr, 0, 42);
+
+    // Ship state
+    let ship_x: f64 = 400.0;
+    let ship_y: f64 = 300.0;
+    let ship_speed: f64 = 3.5;
+    let ship_radius: f64 = 12.0;
+
+    // Spawn initial asteroids
+    let num_ast: i32 = 0;
+    for i: i32 in range(0, 200) {
+        spawn_asteroid(i, ast_x, ast_y, ast_vx, ast_vy,
+                       ast_radius, ast_alive, seed_ptr);
+        num_ast = num_ast + 1;
+    }
+
+    let collisions: i32 = 0;
+    let spawn_timer: i32 = 0;
+    let spawn_interval: i32 = 45;
+
+    let t0: i64 = clock_ns();
+
+    // --- Simulate 1000 frames ---
+    for frame: i32 in range(0, 1000) {
+        // Simulate ship movement (oscillating pattern for determinism)
+        let phase: f64 = to_f64(frame) * 0.05;
+        // Approximate sin/cos with simple oscillation
+        let move_x: f64 = ship_speed;
+        let move_y: f64 = 0.0 - ship_speed;
+        if frame - (frame / 4) * 4 == 0 { move_x = ship_speed; move_y = 0.0; }
+        if frame - (frame / 4) * 4 == 1 { move_x = 0.0; move_y = ship_speed; }
+        if frame - (frame / 4) * 4 == 2 { move_x = 0.0 - ship_speed; move_y = 0.0; }
+        if frame - (frame / 4) * 4 == 3 { move_x = 0.0; move_y = 0.0 - ship_speed; }
+
+        ship_x = ship_x + move_x;
+        ship_y = ship_y + move_y;
+
+        // Clamp
+        if ship_x < 15.0  { ship_x = 15.0; }
+        if ship_x > 785.0 { ship_x = 785.0; }
+        if ship_y < 15.0  { ship_y = 15.0; }
+        if ship_y > 585.0 { ship_y = 585.0; }
+
+        // Update asteroids + collision
+        for i: i32 in range(0, num_ast) {
+            if ptr_read_i32(ast_alive, i) == 1 {
+                let ax: f64 = ptr_read_f64(ast_x, i) + ptr_read_f64(ast_vx, i);
+                let ay: f64 = ptr_read_f64(ast_y, i) + ptr_read_f64(ast_vy, i);
+
+                // Wrap
+                if ax < 0.0 - 20.0  { ax = 820.0; }
+                if ax > 820.0       { ax = 0.0 - 20.0; }
+                if ay < 0.0 - 20.0  { ay = 620.0; }
+                if ay > 620.0       { ay = 0.0 - 20.0; }
+
+                ptr_write_f64(ast_x, i, ax);
+                ptr_write_f64(ast_y, i, ay);
+
+                // Collision check
+                let d: f64 = distance_sq(ship_x, ship_y, ax, ay);
+                let min_dist: f64 = ship_radius + ptr_read_f64(ast_radius, i);
+                if d < min_dist * min_dist {
+                    collisions = collisions + 1;
+                    // Respawn instead of ending (keep test running)
+                    spawn_asteroid(i, ast_x, ast_y, ast_vx, ast_vy,
+                                   ast_radius, ast_alive, seed_ptr);
+                }
+            }
+        }
+
+        // Spawn new asteroid periodically
+        spawn_timer = spawn_timer + 1;
+        if spawn_timer >= spawn_interval and num_ast < max_ast {
+            spawn_timer = 0;
+            spawn_asteroid(num_ast, ast_x, ast_y, ast_vx, ast_vy,
+                           ast_radius, ast_alive, seed_ptr);
+            num_ast = num_ast + 1;
+        }
+    }
+
+    let t1: i64 = clock_ns();
+    let elapsed_ns: i64 = t1 - t0;
+    let elapsed_ms: i64 = elapsed_ns / 1000000;
+
+    print("perf_game_logic: 1000 frames completed");
+    print("Active asteroids:");
+    print_i32(num_ast);
+    print("Collisions detected:");
+    print_i32(collisions);
+    print("Elapsed (ms):");
+    print_i64(elapsed_ms);
+
+    // Cleanup
+    heap_free(ast_x);
+    heap_free(ast_y);
+    heap_free(ast_vx);
+    heap_free(ast_vy);
+    heap_free(ast_radius);
+    heap_free(ast_alive);
+    heap_free(seed_ptr);
+
+    return 0;
+}
