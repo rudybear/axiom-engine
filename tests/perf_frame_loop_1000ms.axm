@@ -1,0 +1,18 @@
+@module perf_frame_loop;
+@intent("Performance test: 1000 empty frames must complete in < 1000ms");
+@constraint { optimize_for: "performance" };
+
+fn main() -> i32 {
+    let gpu: ptr[i32] = gpu_init(800, 600, "Perf Test: Frame Loop");
+
+    let i: i32 = 0;
+    while i < 1000 {
+        gpu_begin_frame(gpu);
+        gpu_end_frame(gpu);
+        i = i + 1;
+    }
+
+    gpu_shutdown(gpu);
+    print("perf_frame_loop: 1000 frames completed");
+    return 0;
+}

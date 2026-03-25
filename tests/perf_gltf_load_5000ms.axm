@@ -1,0 +1,21 @@
+@module perf_gltf_load;
+@intent("Performance test: glTF load + 10 frames must complete in < 5000ms");
+@constraint { optimize_for: "performance" };
+
+fn main() -> i32 {
+    let gpu: ptr[i32] = gpu_init(800, 600, "Perf Test: glTF Load");
+    let scene: i32 = gpu_load_gltf(gpu, "data/DamagedHelmet.glb");
+    gpu_set_camera(gpu, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 60.0);
+
+    let i: i32 = 0;
+    while i < 10 {
+        gpu_begin_frame(gpu);
+        gpu_render(gpu);
+        gpu_end_frame(gpu);
+        i = i + 1;
+    }
+
+    gpu_shutdown(gpu);
+    print("perf_gltf_load: load + 10 frames completed");
+    return 0;
+}
