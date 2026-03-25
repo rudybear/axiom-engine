@@ -475,6 +475,54 @@ pub unsafe extern "C" fn gpu_get_gpu_name(
 }
 
 // ---------------------------------------------------------------------------
+// Procedural mesh generation & per-object drawing — C ABI exports
+// ---------------------------------------------------------------------------
+
+/// Create a unit cube mesh and upload to GPU. Returns a mesh ID.
+#[no_mangle]
+pub unsafe extern "C" fn gpu_create_cube(_handle: *mut std::ffi::c_void) -> c_int {
+    with_renderer(0, |r| r.create_cube() as c_int)
+}
+
+/// Create a UV sphere mesh and upload to GPU. Returns a mesh ID.
+#[no_mangle]
+pub unsafe extern "C" fn gpu_create_sphere(
+    _handle: *mut std::ffi::c_void,
+    segments: c_int,
+    rings: c_int,
+) -> c_int {
+    let seg = if segments > 0 { segments as u32 } else { 16 };
+    let rng = if rings > 0 { rings as u32 } else { 12 };
+    with_renderer(0, |r| r.create_sphere(seg, rng) as c_int)
+}
+
+/// Set the transform (position + scale) for a procedural mesh.
+#[no_mangle]
+pub unsafe extern "C" fn gpu_set_mesh_transform(
+    _handle: *mut std::ffi::c_void,
+    mesh_id: c_int,
+    x: c_double, y: c_double, z: c_double,
+    sx: c_double, sy: c_double, sz: c_double,
+) {
+    with_renderer((), |r| {
+        r.set_mesh_transform(
+            mesh_id as u32,
+            x as f32, y as f32, z as f32,
+            sx as f32, sy as f32, sz as f32,
+        );
+    });
+}
+
+/// Queue a draw command for a procedural mesh with its current transform.
+#[no_mangle]
+pub unsafe extern "C" fn gpu_draw_mesh(
+    _handle: *mut std::ffi::c_void,
+    mesh_id: c_int,
+) {
+    with_renderer((), |r| r.draw_mesh(mesh_id as u32));
+}
+
+// ---------------------------------------------------------------------------
 // G2: Input System — C ABI exports
 // ---------------------------------------------------------------------------
 

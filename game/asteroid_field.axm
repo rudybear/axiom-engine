@@ -1,30 +1,27 @@
 @module asteroid_field;
-@intent("Asteroid Field — 2D top-down space survival game using software renderer");
+@intent("Asteroid Field — 3D space survival game using GPU PBR renderer");
 @constraint { optimize_for: "performance" };
 
 // =============================================================================
-// Asteroid Field — 2D Space Survival Game
+// Asteroid Field — 3D Space Survival Game (GPU PBR Renderer)
 // =============================================================================
 //
-// A top-down space survival game using the AXIOM software renderer.
-// No GPU DLL needed — everything runs through Win32 software rasterization.
+// A 3D space survival game using the AXIOM GPU renderer with PBR shading.
+// Ship = cube mesh, Asteroids = sphere meshes, all rendered with Cook-Torrance.
 //
-//   Ship     = colored triangle (renderer_draw_triangles)
-//   Asteroids = colored points (renderer_draw_points, 2x2 pixels each)
-//   Collision = circle-circle distance test
-//   Controls  = WASD to move, Escape to quit
+//   Controls: WASD to move, Escape to quit
+//   Camera:   top-down 3D perspective looking at the play field
 //
 // SOA layout for asteroids:
-//   ast_x[N], ast_y[N]         : f64 positions
-//   ast_vx[N], ast_vy[N]       : f64 velocities
-//   ast_radius[N]              : f64 collision radius
-//   ast_alive[N]               : i32 (1 = active)
-//   ast_colors[N]              : i32 (0xRRGGBB)
+//   ast_x[N], ast_y[N], ast_z[N] : f64 positions (z always 0)
+//   ast_vx[N], ast_vy[N]         : f64 velocities
+//   ast_radius[N]                : f64 collision radius
+//   ast_alive[N]                 : i32 (1 = active)
 //
 // =============================================================================
 
 // ---------------------------------------------------------------------------
-// Pure helper: squared distance between two 2D points
+// Pure helper: squared distance between two 2D points (XY plane)
 // ---------------------------------------------------------------------------
 
 @pure @inline(always)
@@ -57,47 +54,38 @@ fn lcg_next_i32(seed_ptr: ptr[i64], max: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Spawn a single asteroid at a random screen edge heading inward
+// Spawn a single asteroid at a random edge heading inward (3D world coords)
 // ---------------------------------------------------------------------------
 
 fn spawn_asteroid(idx: i32,
                   ast_x: ptr[f64], ast_y: ptr[f64],
                   ast_vx: ptr[f64], ast_vy: ptr[f64],
                   ast_radius: ptr[f64],
-                  ast_alive: ptr[i32], ast_colors: ptr[i32],
+                  ast_alive: ptr[i32],
                   seed_ptr: ptr[i64], difficulty: f64) {
     let edge: i32 = lcg_next_i32(seed_ptr, 4);
+    // World extents: X in [-20, 20], Y in [-15, 15]
     let sx: f64 = 0.0;
     let sy: f64 = 0.0;
 
-    // Spawn at a random position along a random edge
-    if edge == 0 { sx = 0.0;   sy = lcg_next_f64(seed_ptr, 600.0); }
-    if edge == 1 { sx = 800.0; sy = lcg_next_f64(seed_ptr, 600.0); }
-    if edge == 2 { sx = lcg_next_f64(seed_ptr, 800.0); sy = 0.0; }
-    if edge == 3 { sx = lcg_next_f64(seed_ptr, 800.0); sy = 600.0; }
+    if edge == 0 { sx = 0.0 - 22.0; sy = lcg_next_f64(seed_ptr, 30.0) - 15.0; }
+    if edge == 1 { sx = 22.0;       sy = lcg_next_f64(seed_ptr, 30.0) - 15.0; }
+    if edge == 2 { sx = lcg_next_f64(seed_ptr, 40.0) - 20.0; sy = 0.0 - 17.0; }
+    if edge == 3 { sx = lcg_next_f64(seed_ptr, 40.0) - 20.0; sy = 17.0; }
 
     ptr_write_f64(ast_x, idx, sx);
     ptr_write_f64(ast_y, idx, sy);
 
     // Velocity toward center, scaled by difficulty
-    let base_speed: f64 = 0.3 + difficulty * 0.15;
-    let vx: f64 = (400.0 - sx) * 0.002 * base_speed + lcg_next_f64(seed_ptr, 0.4) - 0.2;
-    let vy: f64 = (300.0 - sy) * 0.002 * base_speed + lcg_next_f64(seed_ptr, 0.4) - 0.2;
+    let base_speed: f64 = 0.02 + difficulty * 0.008;
+    let vx: f64 = (0.0 - sx) * 0.01 * base_speed + lcg_next_f64(seed_ptr, 0.02) - 0.01;
+    let vy: f64 = (0.0 - sy) * 0.01 * base_speed + lcg_next_f64(seed_ptr, 0.02) - 0.01;
     ptr_write_f64(ast_vx, idx, vx);
     ptr_write_f64(ast_vy, idx, vy);
 
-    // Random size: 3.0 to 11.0
-    ptr_write_f64(ast_radius, idx, 3.0 + lcg_next_f64(seed_ptr, 8.0));
+    // Random size: 0.3 to 1.0 world units
+    ptr_write_f64(ast_radius, idx, 0.3 + lcg_next_f64(seed_ptr, 0.7));
     ptr_write_i32(ast_alive, idx, 1);
-
-    // Gray/brown/tan asteroid color
-    let gray: i32 = lcg_next_i32(seed_ptr, 128) + 80;
-    let rr: i32 = gray + lcg_next_i32(seed_ptr, 30);
-    let gg: i32 = gray;
-    let bb: i32 = gray - lcg_next_i32(seed_ptr, 20);
-    if rr > 255 { rr = 255; }
-    if bb < 0 { bb = 0; }
-    ptr_write_i32(ast_colors, idx, rr * 65536 + gg * 256 + bb);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,42 +93,34 @@ fn spawn_asteroid(idx: i32,
 // ---------------------------------------------------------------------------
 
 fn main() -> i32 {
-    let width: i32 = 800;
-    let height: i32 = 600;
+    let width: i32 = 1024;
+    let height: i32 = 768;
 
-    print("Asteroid Field — WASD to move, Escape to quit");
+    print("Asteroid Field 3D — WASD to move, Escape to quit");
 
-    // --- Create software renderer window ---
-    let r: ptr[i32] = renderer_create(width, height, "AXIOM - Asteroid Field");
+    // --- Create GPU renderer window ---
+    let r: ptr[i32] = gpu_init(width, height, "AXIOM - Asteroid Field 3D");
+
+    // --- Set up camera: top-down view looking at XY plane ---
+    gpu_set_camera(r, 0.0, 0.0, 35.0, 0.0, 0.0, 0.0, 50.0);
+
+    // --- Add lights ---
+    gpu_add_light(r, 10.0, 10.0, 20.0, 1.0, 0.9, 0.8, 200.0);
+    gpu_add_light(r, 0.0 - 10.0, 0.0 - 5.0, 15.0, 0.4, 0.6, 1.0, 150.0);
+
+    // --- Create meshes ---
+    let ship_mesh: i32 = gpu_create_cube(r);
+    let ast_mesh: i32 = gpu_create_sphere(r, 12, 8);
 
     // --- RNG seed ---
     let seed_ptr: ptr[i64] = heap_alloc(1, 8);
     ptr_write_i64(seed_ptr, 0, 42);
 
-    // --- Ship state (center of screen) ---
-    let ship_x: f64 = 400.0;
-    let ship_y: f64 = 300.0;
-    let ship_speed: f64 = 3.5;
-    let ship_radius: f64 = 12.0;
-
-    // Ship triangle: 3 vertices x 2 coords (x, y) = 6 doubles for positions
-    // and 3 vertices x 3 color channels (r, g, b) = 9 doubles for colors
-    let ship_pos: ptr[f64] = heap_alloc(6, 8);
-    let ship_col: ptr[f64] = heap_alloc(9, 8);
-
-    // Ship colors: cyan tip, blue wings (constant)
-    // Vertex 0 (top/tip): cyan
-    ptr_write_f64(ship_col, 0, 0.0);
-    ptr_write_f64(ship_col, 1, 1.0);
-    ptr_write_f64(ship_col, 2, 1.0);
-    // Vertex 1 (bottom-left): blue
-    ptr_write_f64(ship_col, 3, 0.0);
-    ptr_write_f64(ship_col, 4, 0.4);
-    ptr_write_f64(ship_col, 5, 1.0);
-    // Vertex 2 (bottom-right): blue
-    ptr_write_f64(ship_col, 6, 0.0);
-    ptr_write_f64(ship_col, 7, 0.4);
-    ptr_write_f64(ship_col, 8, 1.0);
+    // --- Ship state (world coords, center = origin) ---
+    let ship_x: f64 = 0.0;
+    let ship_y: f64 = 0.0;
+    let ship_speed: f64 = 0.15;
+    let ship_radius: f64 = 0.6;
 
     // --- Asteroid arrays (SOA, max 300) ---
     let max_ast: i32 = 300;
@@ -150,19 +130,13 @@ fn main() -> i32 {
     let ast_vy:     ptr[f64] = heap_alloc_zeroed(max_ast, 8);
     let ast_radius: ptr[f64] = heap_alloc_zeroed(max_ast, 8);
     let ast_alive:  ptr[i32] = heap_alloc_zeroed(max_ast, 4);
-    let ast_colors: ptr[i32] = heap_alloc_zeroed(max_ast, 4);
-
-    // Draw buffers for renderer_draw_points (only alive asteroids)
-    let draw_x:      ptr[f64] = heap_alloc_zeroed(max_ast, 8);
-    let draw_y:      ptr[f64] = heap_alloc_zeroed(max_ast, 8);
-    let draw_colors: ptr[i32] = heap_alloc_zeroed(max_ast, 4);
 
     // --- Spawn initial asteroids ---
     let num_ast: i32 = 0;
     let initial_count: i32 = 40;
     for i: i32 in range(0, initial_count) {
         spawn_asteroid(i, ast_x, ast_y, ast_vx, ast_vy,
-                       ast_radius, ast_alive, ast_colors,
+                       ast_radius, ast_alive,
                        seed_ptr, 1.0);
     }
     num_ast = initial_count;
@@ -178,25 +152,26 @@ fn main() -> i32 {
     // =====================================================================
     // GAME LOOP
     // =====================================================================
-    while renderer_should_close(r) == 0 and alive == 1 {
-        renderer_begin_frame(r);
+    while gpu_should_close(r) == 0 and alive == 1 {
+        let ok: i32 = gpu_begin_frame(r);
+        if ok == 0 { alive = 0; }
 
         // --- Escape to quit ---
         if is_key_down(27) == 1 {
             alive = 0;
         }
 
-        // --- INPUT: WASD movement ---
-        if is_key_down(87) == 1 { ship_y = ship_y - ship_speed; }
-        if is_key_down(83) == 1 { ship_y = ship_y + ship_speed; }
+        // --- INPUT: WASD movement (in world XY plane) ---
+        if is_key_down(87) == 1 { ship_y = ship_y + ship_speed; }
+        if is_key_down(83) == 1 { ship_y = ship_y - ship_speed; }
         if is_key_down(65) == 1 { ship_x = ship_x - ship_speed; }
         if is_key_down(68) == 1 { ship_x = ship_x + ship_speed; }
 
-        // Clamp ship to screen bounds (with margin)
-        if ship_x < 15.0  { ship_x = 15.0; }
-        if ship_x > 785.0 { ship_x = 785.0; }
-        if ship_y < 15.0  { ship_y = 15.0; }
-        if ship_y > 585.0 { ship_y = 585.0; }
+        // Clamp ship to world bounds
+        if ship_x < 0.0 - 18.0 { ship_x = 0.0 - 18.0; }
+        if ship_x > 18.0       { ship_x = 18.0; }
+        if ship_y < 0.0 - 13.0 { ship_y = 0.0 - 13.0; }
+        if ship_y > 13.0       { ship_y = 13.0; }
 
         // --- UPDATE ASTEROIDS ---
         for i: i32 in range(0, num_ast) {
@@ -204,11 +179,11 @@ fn main() -> i32 {
                 let ax: f64 = ptr_read_f64(ast_x, i) + ptr_read_f64(ast_vx, i);
                 let ay: f64 = ptr_read_f64(ast_y, i) + ptr_read_f64(ast_vy, i);
 
-                // Wrap around screen edges
-                if ax < 0.0 - 20.0  { ax = 820.0; }
-                if ax > 820.0       { ax = 0.0 - 20.0; }
-                if ay < 0.0 - 20.0  { ay = 620.0; }
-                if ay > 620.0       { ay = 0.0 - 20.0; }
+                // Wrap around world edges
+                if ax < 0.0 - 25.0 { ax = 25.0; }
+                if ax > 25.0       { ax = 0.0 - 25.0; }
+                if ay < 0.0 - 20.0 { ay = 20.0; }
+                if ay > 20.0       { ay = 0.0 - 20.0; }
 
                 ptr_write_f64(ast_x, i, ax);
                 ptr_write_f64(ast_y, i, ay);
@@ -233,7 +208,7 @@ fn main() -> i32 {
             if difficulty > 5.0 { difficulty = 5.0; }
 
             spawn_asteroid(num_ast, ast_x, ast_y, ast_vx, ast_vy,
-                           ast_radius, ast_alive, ast_colors,
+                           ast_radius, ast_alive,
                            seed_ptr, difficulty);
             num_ast = num_ast + 1;
 
@@ -246,35 +221,23 @@ fn main() -> i32 {
         }
 
         // --- RENDER ---
-        renderer_clear(r, 0);
+        // Draw ship as a cube at (ship_x, ship_y, 0), scale 1x1x0.3
+        gpu_set_mesh_transform(r, ship_mesh, ship_x, ship_y, 0.0, 1.0, 1.0, 0.3);
+        gpu_draw_mesh(r, ship_mesh);
 
-        // Draw ship as triangle
-        // Positions: 2 doubles per vertex (x, y)
-        // Vertex 0: tip (top)
-        ptr_write_f64(ship_pos, 0, ship_x);
-        ptr_write_f64(ship_pos, 1, ship_y - 15.0);
-        // Vertex 1: bottom-left wing
-        ptr_write_f64(ship_pos, 2, ship_x - 10.0);
-        ptr_write_f64(ship_pos, 3, ship_y + 10.0);
-        // Vertex 2: bottom-right wing
-        ptr_write_f64(ship_pos, 4, ship_x + 10.0);
-        ptr_write_f64(ship_pos, 5, ship_y + 10.0);
-
-        renderer_draw_triangles(r, ship_pos, ship_col, 3);
-
-        // Draw asteroids as colored points (only alive ones)
-        let draw_count: i32 = 0;
+        // Draw each alive asteroid as a sphere
         for i: i32 in range(0, num_ast) {
             if ptr_read_i32(ast_alive, i) == 1 {
-                ptr_write_f64(draw_x, draw_count, ptr_read_f64(ast_x, i));
-                ptr_write_f64(draw_y, draw_count, ptr_read_f64(ast_y, i));
-                ptr_write_i32(draw_colors, draw_count, ptr_read_i32(ast_colors, i));
-                draw_count = draw_count + 1;
+                let ax: f64 = ptr_read_f64(ast_x, i);
+                let ay: f64 = ptr_read_f64(ast_y, i);
+                let ar: f64 = ptr_read_f64(ast_radius, i);
+                let diam: f64 = ar * 2.0;
+                gpu_set_mesh_transform(r, ast_mesh, ax, ay, 0.0, diam, diam, diam);
+                gpu_draw_mesh(r, ast_mesh);
             }
         }
-        renderer_draw_points(r, draw_x, draw_y, draw_colors, draw_count);
 
-        renderer_end_frame(r);
+        gpu_end_frame(r);
         score = score + 1;
     }
 
@@ -285,29 +248,23 @@ fn main() -> i32 {
     print_i32(score);
     play_beep(200, 300);
 
-    // Show dark red screen until window is closed
-    while renderer_should_close(r) == 0 {
-        renderer_begin_frame(r);
-        renderer_clear(r, 3342336);
-        renderer_end_frame(r);
+    // Show scene frozen until window is closed
+    while gpu_should_close(r) == 0 {
+        let ok2: i32 = gpu_begin_frame(r);
+        if ok2 == 0 { ok2 = 0; }
+        gpu_end_frame(r);
     }
 
     // --- Cleanup ---
     heap_free(seed_ptr);
-    heap_free(ship_pos);
-    heap_free(ship_col);
     heap_free(ast_x);
     heap_free(ast_y);
     heap_free(ast_vx);
     heap_free(ast_vy);
     heap_free(ast_radius);
     heap_free(ast_alive);
-    heap_free(ast_colors);
-    heap_free(draw_x);
-    heap_free(draw_y);
-    heap_free(draw_colors);
-    renderer_destroy(r);
+    gpu_shutdown(r);
 
-    print("Asteroid Field complete.");
+    print("Asteroid Field 3D complete.");
     return 0;
 }

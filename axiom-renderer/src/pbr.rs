@@ -39,6 +39,13 @@ struct LightUniform {
 };
 @group(0) @binding(1) var<uniform> light_data: LightUniform;
 
+// ---- Model matrix uniform (bind group 2, binding 0) ----
+struct ModelUniform {
+    model: mat4x4<f32>,
+    normal_matrix: mat4x4<f32>,
+};
+@group(2) @binding(0) var<uniform> model_data: ModelUniform;
+
 // ---- Material uniform (bind group 1, binding 0) ----
 struct MaterialParams {
     base_color: vec4<f32>,
@@ -81,13 +88,14 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let world_pos = in.position; // No model transform in Phase 1
+    let world_pos = (model_data.model * vec4<f32>(in.position, 1.0)).xyz;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
     out.world_pos = world_pos;
-    out.world_normal = normalize(in.normal);
+    out.world_normal = normalize((model_data.normal_matrix * vec4<f32>(in.normal, 0.0)).xyz);
     out.uv = in.uv;
-    out.tangent = normalize(in.tangent.xyz);
-    out.bitangent = cross(out.world_normal, out.tangent) * in.tangent.w;
+    let world_tangent = normalize((model_data.model * vec4<f32>(in.tangent.xyz, 0.0)).xyz);
+    out.tangent = world_tangent;
+    out.bitangent = cross(out.world_normal, world_tangent) * in.tangent.w;
     return out;
 }
 
@@ -230,14 +238,25 @@ pub struct LightUniformGpu {
     pub _pad2: u32,
 }
 
+/// GPU-side model uniform (matches WGSL ModelUniform).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ModelUniformGpu {
+    pub model: [[f32; 4]; 4],
+    pub normal_matrix: [[f32; 4]; 4],
+}
+
 /// The PBR render pipeline and associated GPU resources.
 pub struct PbrPipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub camera_bind_group_layout: wgpu::BindGroupLayout,
     pub material_bind_group_layout: wgpu::BindGroupLayout,
+    pub model_bind_group_layout: wgpu::BindGroupLayout,
     pub camera_buffer: wgpu::Buffer,
     pub light_buffer: wgpu::Buffer,
+    pub model_buffer: wgpu::Buffer,
     pub camera_bind_group: wgpu::BindGroup,
+    pub model_bind_group: wgpu::BindGroup,
     pub default_sampler: wgpu::Sampler,
     // Fallback textures for materials missing images
     pub fallback_white_tex: wgpu::Texture,
@@ -248,6 +267,8 @@ pub struct PbrPipeline {
     pub fallback_mr_view: wgpu::TextureView,
     pub fallback_emissive_tex: wgpu::Texture,
     pub fallback_emissive_view: wgpu::TextureView,
+    /// Default material bind group using fallback textures (for procedural meshes).
+    pub default_material_bind_group: wgpu::BindGroup,
 }
 
 impl PbrPipeline {
@@ -421,6 +442,56 @@ impl PbrPipeline {
             ],
         });
 
+        // --- Model matrix bind group layout (group 2) ---
+        let model_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("PBR model bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        // --- Model uniform buffer (identity matrix by default) ---
+        let identity = ModelUniformGpu {
+            model: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            normal_matrix: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        let model_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("PBR model uniform"),
+            contents: bytemuck::bytes_of(&identity),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let model_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PBR model bind group"),
+            layout: &model_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: model_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
         // --- Default sampler ---
         let default_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("PBR default sampler"),
@@ -449,10 +520,10 @@ impl PbrPipeline {
             source: wgpu::ShaderSource::Wgsl(PBR_SHADER_SRC.into()),
         });
 
-        // --- Pipeline layout ---
+        // --- Pipeline layout (group 0: camera+light, group 1: material, group 2: model) ---
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PBR Pipeline Layout"),
-            bind_group_layouts: &[&camera_bind_group_layout, &material_bind_group_layout],
+            bind_group_layouts: &[&camera_bind_group_layout, &material_bind_group_layout, &model_bind_group_layout],
             push_constant_ranges: &[],
         });
 
@@ -501,15 +572,78 @@ impl PbrPipeline {
             cache: None,
         });
 
+        // --- Default material bind group (for procedural meshes) ---
+        let default_mat_params = crate::gltf_load::MaterialParams {
+            base_color: [0.8, 0.8, 0.8, 1.0],
+            metallic: 0.0,
+            roughness: 0.5,
+            emissive_x: 0.0,
+            emissive_y: 0.0,
+            emissive_z: 0.0,
+            _pad0: 0.0,
+            _pad1: 0.0,
+            _pad2: 0.0,
+        };
+        let default_mat_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("default procedural material params"),
+            contents: bytemuck::bytes_of(&default_mat_params),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let default_material_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("default procedural material bind group"),
+            layout: &material_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: default_mat_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&fallback_white_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&default_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&fallback_normal_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&default_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(&fallback_mr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: wgpu::BindingResource::Sampler(&default_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: wgpu::BindingResource::TextureView(&fallback_emissive_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: wgpu::BindingResource::Sampler(&default_sampler),
+                },
+            ],
+        });
+
         println!("[AXIOM PBR] Pipeline created");
 
         Self {
             pipeline,
             camera_bind_group_layout,
             material_bind_group_layout,
+            model_bind_group_layout,
             camera_buffer,
             light_buffer,
+            model_buffer,
             camera_bind_group,
+            model_bind_group,
             default_sampler,
             fallback_white_tex,
             fallback_white_view,
@@ -519,12 +653,18 @@ impl PbrPipeline {
             fallback_mr_view,
             fallback_emissive_tex,
             fallback_emissive_view,
+            default_material_bind_group,
         }
     }
 
     /// Update the camera uniform buffer.
     pub fn update_camera(&self, queue: &wgpu::Queue, uniform: &CameraUniform) {
         queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(uniform));
+    }
+
+    /// Update the model matrix uniform buffer.
+    pub fn update_model(&self, queue: &wgpu::Queue, uniform: &ModelUniformGpu) {
+        queue.write_buffer(&self.model_buffer, 0, bytemuck::bytes_of(uniform));
     }
 
     /// Update the light uniform buffer (R5: Multi-light support).

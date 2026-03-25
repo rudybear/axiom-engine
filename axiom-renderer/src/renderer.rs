@@ -15,8 +15,8 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
 use crate::camera::{CameraState, CameraUniform};
-use crate::gltf_load::GpuScene;
-use crate::pbr::PbrPipeline;
+use crate::gltf_load::{GpuScene, PbrVertex};
+use crate::pbr::{ModelUniformGpu, PbrPipeline};
 
 // ---------------------------------------------------------------------------
 // Vertex layout shared by points and triangles
@@ -52,6 +52,44 @@ enum DrawCommand {
     Clear { r: f64, g: f64, b: f64 },
     Points(Vec<Vertex>),
     Triangles(Vec<Vertex>),
+}
+
+// ---------------------------------------------------------------------------
+// Procedural mesh support
+// ---------------------------------------------------------------------------
+
+/// A procedural mesh (cube, sphere, etc.) stored on the GPU.
+pub struct ProceduralMesh {
+    pub vertex_buffer: wgpu::Buffer,
+    pub index_buffer: wgpu::Buffer,
+    pub num_indices: u32,
+    pub id: u32,
+}
+
+/// Per-mesh transform: translation + scale.
+#[derive(Clone)]
+struct MeshTransform {
+    x: f32,
+    y: f32,
+    z: f32,
+    sx: f32,
+    sy: f32,
+    sz: f32,
+}
+
+impl Default for MeshTransform {
+    fn default() -> Self {
+        Self {
+            x: 0.0, y: 0.0, z: 0.0,
+            sx: 1.0, sy: 1.0, sz: 1.0,
+        }
+    }
+}
+
+/// A queued draw command for a procedural mesh.
+struct MeshDrawCommand {
+    mesh_id: u32,
+    transform: MeshTransform,
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +144,12 @@ pub struct Renderer {
 
     // R5: Multi-light support
     lights: crate::pbr::LightUniformGpu,
+
+    // Procedural mesh support
+    procedural_meshes: Vec<ProceduralMesh>,
+    mesh_transforms: HashMap<u32, MeshTransform>,
+    mesh_draw_queue: Vec<MeshDrawCommand>,
+    next_mesh_id: u32,
 }
 
 // Inline WGSL shader source
@@ -263,6 +307,11 @@ impl Renderer {
                 _pad1: 0,
                 _pad2: 0,
             },
+            // Procedural mesh support
+            procedural_meshes: Vec::new(),
+            mesh_transforms: HashMap::new(),
+            mesh_draw_queue: Vec::new(),
+            next_mesh_id: 1,
         })
     }
 
@@ -835,6 +884,21 @@ impl Renderer {
             let aspect = width as f32 / height.max(1) as f32;
             let camera_uniform = CameraUniform::from_state(&self.camera, aspect);
             pbr.update_camera(&self.queue, &camera_uniform);
+            let identity = ModelUniformGpu {
+                model: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                normal_matrix: [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+            };
+            pbr.update_model(&self.queue, &identity);
 
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Screenshot Render Encoder"),
@@ -867,6 +931,7 @@ impl Renderer {
 
                 render_pass.set_pipeline(&pbr.pipeline);
                 render_pass.set_bind_group(0, &pbr.camera_bind_group, &[]);
+                render_pass.set_bind_group(2, &pbr.model_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, scene.vertex_buffer.slice(..));
                 render_pass.set_index_buffer(scene.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
@@ -979,6 +1044,227 @@ impl Renderer {
 
         println!("[AXIOM Screenshot] Saved to {path}");
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Procedural mesh generation
+    // -----------------------------------------------------------------------
+
+    /// Create a unit cube (-0.5 to 0.5) and upload to GPU.
+    /// Returns a mesh ID.
+    pub fn create_cube(&mut self) -> u32 {
+        self.ensure_pbr_pipeline();
+
+        let id = self.next_mesh_id;
+        self.next_mesh_id += 1;
+
+        // 6 faces, 2 triangles each, 3 vertices per triangle = 36 vertices
+        // Each face has 4 unique vertices, 6 indices
+        let mut vertices: Vec<PbrVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        // Face data: (normal, tangent, 4 corner positions)
+        let faces: [([f32; 3], [f32; 4], [[f32; 3]; 4]); 6] = [
+            // +Z face (front)
+            ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0], [
+                [-0.5, -0.5,  0.5], [ 0.5, -0.5,  0.5], [ 0.5,  0.5,  0.5], [-0.5,  0.5,  0.5],
+            ]),
+            // -Z face (back)
+            ([0.0, 0.0, -1.0], [-1.0, 0.0, 0.0, 1.0], [
+                [ 0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5,  0.5, -0.5], [ 0.5,  0.5, -0.5],
+            ]),
+            // +X face (right)
+            ([1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0], [
+                [ 0.5, -0.5,  0.5], [ 0.5, -0.5, -0.5], [ 0.5,  0.5, -0.5], [ 0.5,  0.5,  0.5],
+            ]),
+            // -X face (left)
+            ([-1.0, 0.0, 0.0], [0.0, 0.0, -1.0, 1.0], [
+                [-0.5, -0.5, -0.5], [-0.5, -0.5,  0.5], [-0.5,  0.5,  0.5], [-0.5,  0.5, -0.5],
+            ]),
+            // +Y face (top)
+            ([0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 1.0], [
+                [-0.5,  0.5,  0.5], [ 0.5,  0.5,  0.5], [ 0.5,  0.5, -0.5], [-0.5,  0.5, -0.5],
+            ]),
+            // -Y face (bottom)
+            ([0.0, -1.0, 0.0], [1.0, 0.0, 0.0, 1.0], [
+                [-0.5, -0.5, -0.5], [ 0.5, -0.5, -0.5], [ 0.5, -0.5,  0.5], [-0.5, -0.5,  0.5],
+            ]),
+        ];
+
+        let face_uvs: [[f32; 2]; 4] = [
+            [0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0],
+        ];
+
+        for (normal, tangent, corners) in &faces {
+            let base = vertices.len() as u32;
+            for (i, pos) in corners.iter().enumerate() {
+                vertices.push(PbrVertex {
+                    position: *pos,
+                    normal: *normal,
+                    uv: face_uvs[i],
+                    tangent: *tangent,
+                });
+            }
+            // Two triangles: 0-1-2, 0-2-3
+            indices.push(base);
+            indices.push(base + 1);
+            indices.push(base + 2);
+            indices.push(base);
+            indices.push(base + 2);
+            indices.push(base + 3);
+        }
+
+        let num_indices = indices.len() as u32;
+
+        let vertex_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Cube vertex buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+
+        let index_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Cube index buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            },
+        );
+
+        self.procedural_meshes.push(ProceduralMesh {
+            vertex_buffer,
+            index_buffer,
+            num_indices,
+            id,
+        });
+
+        self.mesh_transforms.insert(id, MeshTransform::default());
+        println!("[AXIOM Renderer] Created cube mesh id={id}");
+        id
+    }
+
+    /// Create a UV sphere and upload to GPU.
+    /// Returns a mesh ID.
+    pub fn create_sphere(&mut self, segments: u32, rings: u32) -> u32 {
+        self.ensure_pbr_pipeline();
+
+        let id = self.next_mesh_id;
+        self.next_mesh_id += 1;
+
+        let segments = segments.max(3);
+        let rings = rings.max(2);
+
+        let mut vertices: Vec<PbrVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        // Generate vertices
+        for ring in 0..=rings {
+            let phi = std::f32::consts::PI * ring as f32 / rings as f32;
+            let sin_phi = phi.sin();
+            let cos_phi = phi.cos();
+
+            for seg in 0..=segments {
+                let theta = 2.0 * std::f32::consts::PI * seg as f32 / segments as f32;
+                let sin_theta = theta.sin();
+                let cos_theta = theta.cos();
+
+                let x = sin_phi * cos_theta;
+                let y = cos_phi;
+                let z = sin_phi * sin_theta;
+
+                let u = seg as f32 / segments as f32;
+                let v = ring as f32 / rings as f32;
+
+                // Tangent: derivative with respect to theta
+                let tx = -sin_theta;
+                let tz = cos_theta;
+
+                vertices.push(PbrVertex {
+                    position: [x * 0.5, y * 0.5, z * 0.5],
+                    normal: [x, y, z],
+                    uv: [u, v],
+                    tangent: [tx, 0.0, tz, 1.0],
+                });
+            }
+        }
+
+        // Generate indices
+        for ring in 0..rings {
+            for seg in 0..segments {
+                let current = ring * (segments + 1) + seg;
+                let next = current + segments + 1;
+
+                indices.push(current);
+                indices.push(next);
+                indices.push(current + 1);
+
+                indices.push(current + 1);
+                indices.push(next);
+                indices.push(next + 1);
+            }
+        }
+
+        let num_indices = indices.len() as u32;
+
+        let vertex_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Sphere vertex buffer"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            },
+        );
+
+        let index_buffer = self.device.create_buffer_init(
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Sphere index buffer"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: wgpu::BufferUsages::INDEX,
+            },
+        );
+
+        self.procedural_meshes.push(ProceduralMesh {
+            vertex_buffer,
+            index_buffer,
+            num_indices,
+            id,
+        });
+
+        self.mesh_transforms.insert(id, MeshTransform::default());
+        println!("[AXIOM Renderer] Created sphere mesh id={id} (segments={segments}, rings={rings})");
+        id
+    }
+
+    /// Set the transform (position + scale) for a procedural mesh.
+    pub fn set_mesh_transform(&mut self, mesh_id: u32, x: f32, y: f32, z: f32, sx: f32, sy: f32, sz: f32) {
+        self.mesh_transforms.insert(mesh_id, MeshTransform { x, y, z, sx, sy, sz });
+    }
+
+    /// Queue a draw command for a procedural mesh with its current transform.
+    pub fn draw_mesh(&mut self, mesh_id: u32) {
+        let transform = self.mesh_transforms.get(&mesh_id)
+            .cloned()
+            .unwrap_or_default();
+        self.mesh_draw_queue.push(MeshDrawCommand {
+            mesh_id,
+            transform,
+        });
+    }
+
+    /// Build a model matrix + normal matrix from a MeshTransform.
+    fn build_model_uniform(t: &MeshTransform) -> ModelUniformGpu {
+        let model = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::new(t.sx, t.sy, t.sz),
+            glam::Quat::IDENTITY,
+            glam::Vec3::new(t.x, t.y, t.z),
+        );
+        // Normal matrix = transpose(inverse(model)) for non-uniform scale
+        // We use the upper-left 3x3 and extend to 4x4
+        let normal_matrix = model.inverse().transpose();
+        ModelUniformGpu {
+            model: model.to_cols_array_2d(),
+            normal_matrix: normal_matrix.to_cols_array_2d(),
+        }
     }
 
     pub fn destroy(&mut self) {
@@ -1111,12 +1397,27 @@ impl Renderer {
             None => return,
         };
 
-        // Update camera + lights
+        // Update camera + lights + identity model
         let aspect = self.width as f32 / self.height.max(1) as f32;
         let camera_uniform = CameraUniform::from_state(&self.camera, aspect);
         let pbr = self.pbr_pipeline.as_ref().unwrap();
         pbr.update_camera(&self.queue, &camera_uniform);
         pbr.update_lights(&self.queue, &self.lights);
+        let identity = ModelUniformGpu {
+            model: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            normal_matrix: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        pbr.update_model(&self.queue, &identity);
 
         // Create per-instance buffer of mat4 transforms
         let instance_data: Vec<u8> = transforms.iter()
@@ -1192,6 +1493,7 @@ impl Renderer {
 
             render_pass.set_pipeline(&pbr.pipeline);
             render_pass.set_bind_group(0, &pbr.camera_bind_group, &[]);
+            render_pass.set_bind_group(2, &pbr.model_bind_group, &[]);
             render_pass.set_vertex_buffer(0, scene.vertex_buffer.slice(..));
             render_pass.set_vertex_buffer(1, instance_buffer.slice(..));
             render_pass.set_index_buffer(scene.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -1227,12 +1529,28 @@ impl Renderer {
             None => return,
         };
 
-        // Update camera + light uniforms
+        // Update camera + light uniforms + identity model matrix
         let aspect = self.width as f32 / self.height.max(1) as f32;
         let camera_uniform = CameraUniform::from_state(&self.camera, aspect);
         let pbr = self.pbr_pipeline.as_ref().unwrap();
         pbr.update_camera(&self.queue, &camera_uniform);
         pbr.update_lights(&self.queue, &self.lights);
+        // Write identity model matrix for glTF scene rendering
+        let identity = ModelUniformGpu {
+            model: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            normal_matrix: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+        pbr.update_model(&self.queue, &identity);
 
         // Get surface texture
         let output = match self.surface.get_current_texture() {
@@ -1294,6 +1612,7 @@ impl Renderer {
 
             render_pass.set_pipeline(&pbr.pipeline);
             render_pass.set_bind_group(0, &pbr.camera_bind_group, &[]);
+            render_pass.set_bind_group(2, &pbr.model_bind_group, &[]);
             render_pass.set_vertex_buffer(0, scene.vertex_buffer.slice(..));
             render_pass.set_index_buffer(scene.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
@@ -1318,12 +1637,127 @@ impl Renderer {
         self.begin_frame()
     }
 
-    /// End frame with timing support.
+    /// End frame with timing support. Flushes any queued mesh draw commands.
     pub fn end_frame_timed(&mut self) {
+        // If there are mesh draw commands, render them
+        if !self.mesh_draw_queue.is_empty() {
+            self.flush_mesh_draws();
+        }
+
         if let Some(start) = self.frame_start.take() {
             self.last_frame_time = start.elapsed().as_secs_f64();
         }
         self.frame_count += 1;
+    }
+
+    /// Flush all queued procedural mesh draw commands into a single render pass.
+    fn flush_mesh_draws(&mut self) {
+        self.ensure_pbr_pipeline();
+        self.ensure_depth_texture();
+
+        let depth_view = match &self.depth_view {
+            Some(v) => v,
+            None => {
+                self.mesh_draw_queue.clear();
+                return;
+            }
+        };
+
+        // Update camera + lights
+        let aspect = self.width as f32 / self.height.max(1) as f32;
+        let camera_uniform = CameraUniform::from_state(&self.camera, aspect);
+        let pbr = self.pbr_pipeline.as_ref().unwrap();
+        pbr.update_camera(&self.queue, &camera_uniform);
+        pbr.update_lights(&self.queue, &self.lights);
+
+        // Get surface texture
+        let output = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.surface_config);
+                match self.surface.get_current_texture() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        eprintln!("[AXIOM Renderer] Surface error in flush_mesh_draws: {e}");
+                        self.mesh_draw_queue.clear();
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[AXIOM Renderer] Surface error in flush_mesh_draws: {e}");
+                self.mesh_draw_queue.clear();
+                return;
+            }
+        };
+
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Mesh Draw Encoder"),
+            });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Mesh Draw Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.02, g: 0.02, b: 0.05, a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+
+            let pbr = self.pbr_pipeline.as_ref().unwrap();
+            render_pass.set_pipeline(&pbr.pipeline);
+            render_pass.set_bind_group(0, &pbr.camera_bind_group, &[]);
+            render_pass.set_bind_group(1, &pbr.default_material_bind_group, &[]);
+
+            // Draw each queued mesh
+            for cmd in &self.mesh_draw_queue {
+                // Find the mesh
+                let mesh = match self.procedural_meshes.iter().find(|m| m.id == cmd.mesh_id) {
+                    Some(m) => m,
+                    None => continue,
+                };
+
+                // Update model matrix
+                let model_uniform = Self::build_model_uniform(&cmd.transform);
+                self.queue.write_buffer(
+                    &pbr.model_buffer,
+                    0,
+                    bytemuck::bytes_of(&model_uniform),
+                );
+
+                render_pass.set_bind_group(2, &pbr.model_bind_group, &[]);
+                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            }
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        self.mesh_draw_queue.clear();
     }
 
     /// Get the last frame time in seconds.
