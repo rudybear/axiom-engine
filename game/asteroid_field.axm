@@ -248,10 +248,25 @@ fn main() -> i32 {
     print_i32(score);
     play_beep(200, 300);
 
-    // Show scene frozen until window is closed
+    // Show frozen scene until window is closed or R pressed to restart
     while gpu_should_close(r) == 0 {
         let ok2: i32 = gpu_begin_frame(r);
-        if ok2 == 0 { ok2 = 0; }
+
+        // Redraw ship at death position
+        gpu_set_mesh_transform(r, ship_mesh, ship_x, ship_y, 0.0, 1.0, 1.0, 0.3);
+        gpu_draw_mesh(r, ship_mesh);
+
+        // Redraw all asteroids frozen
+        for i: i32 in range(0, num_ast) {
+            if ptr_read_i32(ast_alive, i) == 1 {
+                let ax: f64 = ptr_read_f64(ast_x, i);
+                let ay: f64 = ptr_read_f64(ast_y, i);
+                let diam: f64 = ptr_read_f64(ast_radius, i) * 2.0;
+                gpu_set_mesh_transform(r, ast_mesh, ax, ay, 0.0, diam, diam, diam);
+                gpu_draw_mesh(r, ast_mesh);
+            }
+        }
+
         gpu_end_frame(r);
     }
 
