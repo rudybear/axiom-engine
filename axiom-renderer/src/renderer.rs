@@ -185,6 +185,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Map winit KeyCode to Win32 Virtual Key codes for AXIOM compatibility.
+fn winit_keycode_to_vk(code: winit::keyboard::KeyCode) -> usize {
+    use winit::keyboard::KeyCode;
+    match code {
+        KeyCode::KeyA => 65, KeyCode::KeyB => 66, KeyCode::KeyC => 67,
+        KeyCode::KeyD => 68, KeyCode::KeyE => 69, KeyCode::KeyF => 70,
+        KeyCode::KeyG => 71, KeyCode::KeyH => 72, KeyCode::KeyI => 73,
+        KeyCode::KeyJ => 74, KeyCode::KeyK => 75, KeyCode::KeyL => 76,
+        KeyCode::KeyM => 77, KeyCode::KeyN => 78, KeyCode::KeyO => 79,
+        KeyCode::KeyP => 80, KeyCode::KeyQ => 81, KeyCode::KeyR => 82,
+        KeyCode::KeyS => 83, KeyCode::KeyT => 84, KeyCode::KeyU => 85,
+        KeyCode::KeyV => 86, KeyCode::KeyW => 87, KeyCode::KeyX => 88,
+        KeyCode::KeyY => 89, KeyCode::KeyZ => 90,
+        KeyCode::Digit0 => 48, KeyCode::Digit1 => 49, KeyCode::Digit2 => 50,
+        KeyCode::Digit3 => 51, KeyCode::Digit4 => 52, KeyCode::Digit5 => 53,
+        KeyCode::Digit6 => 54, KeyCode::Digit7 => 55, KeyCode::Digit8 => 56,
+        KeyCode::Digit9 => 57,
+        KeyCode::Space => 32,
+        KeyCode::Escape => 27,
+        KeyCode::Enter => 13,
+        KeyCode::Tab => 9,
+        KeyCode::Backspace => 8,
+        KeyCode::ArrowUp => 38, KeyCode::ArrowDown => 40,
+        KeyCode::ArrowLeft => 37, KeyCode::ArrowRight => 39,
+        KeyCode::ShiftLeft => 16, KeyCode::ShiftRight => 16,
+        KeyCode::ControlLeft => 17, KeyCode::ControlRight => 17,
+        _ => 255, // unmapped
+    }
+}
+
 impl Renderer {
     /// Create a new renderer with a window of the given size.
     ///
@@ -496,11 +526,13 @@ impl Renderer {
                                 }
                             }
                             // G2: Input System — track keyboard events
+                            // Map winit KeyCode to Win32 VK codes so AXIOM programs
+                            // can use familiar key constants (W=87, A=65, etc.)
                             WindowEvent::KeyboardInput { event: key_event, .. } => {
                                 if let winit::keyboard::PhysicalKey::Code(code) = key_event.physical_key {
-                                    let idx = code as usize;
-                                    if idx < 256 {
-                                        self.key_state[idx] = key_event.state == winit::event::ElementState::Pressed;
+                                    let vk = winit_keycode_to_vk(code);
+                                    if vk < 256 {
+                                        self.key_state[vk] = key_event.state == winit::event::ElementState::Pressed;
                                     }
                                 }
                             }
