@@ -32,9 +32,62 @@ fn distance_sq(x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Pure hot-loop: update asteroid positions + wrap around world edges
+// Writes through pointers (argmem:readwrite) — still gets fast-math.
+// ---------------------------------------------------------------------------
+
+@pure
+fn update_asteroids(ast_x: ptr[f64], ast_y: ptr[f64],
+                    ast_vx: ptr[f64], ast_vy: ptr[f64],
+                    ast_alive: ptr[i32], num_ast: i32,
+                    x_min: f64, x_max: f64,
+                    y_min: f64, y_max: f64) {
+    for i: i32 in range(0, num_ast) {
+        if ptr_read_i32(ast_alive, i) == 1 {
+            let ax: f64 = ptr_read_f64(ast_x, i) + ptr_read_f64(ast_vx, i);
+            let ay: f64 = ptr_read_f64(ast_y, i) + ptr_read_f64(ast_vy, i);
+
+            // Wrap around world edges
+            if ax < x_min { ax = x_max; }
+            if ax > x_max { ax = x_min; }
+            if ay < y_min { ay = y_max; }
+            if ay > y_max { ay = y_min; }
+
+            ptr_write_f64(ast_x, i, ax);
+            ptr_write_f64(ast_y, i, ay);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure hot-loop: check ship-vs-asteroid collisions (read-only on arrays)
+// Returns 1 if any collision detected, 0 otherwise.
+// ---------------------------------------------------------------------------
+
+@pure
+fn check_collisions(ship_x: f64, ship_y: f64, ship_radius: f64,
+                    ast_x: ptr[f64], ast_y: ptr[f64],
+                    ast_radius: ptr[f64], ast_alive: ptr[i32],
+                    num_ast: i32) -> i32 {
+    for i: i32 in range(0, num_ast) {
+        if ptr_read_i32(ast_alive, i) == 1 {
+            let ax: f64 = ptr_read_f64(ast_x, i);
+            let ay: f64 = ptr_read_f64(ast_y, i);
+            let d: f64 = distance_sq(ship_x, ship_y, ax, ay);
+            let min_dist: f64 = ship_radius + ptr_read_f64(ast_radius, i);
+            if d < min_dist * min_dist {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // LCG pseudo-random number generator
 // ---------------------------------------------------------------------------
 
+@inline(always)
 fn lcg_next(seed_ptr: ptr[i64]) -> i64 {
     let s: i64 = ptr_read_i64(seed_ptr, 0);
     s = s * 6364136223846793005 + 1442695040888963407;
@@ -43,11 +96,13 @@ fn lcg_next(seed_ptr: ptr[i64]) -> i64 {
     return band(bits, 2147483647);
 }
 
+@inline(always)
 fn lcg_next_f64(seed_ptr: ptr[i64], max: f64) -> f64 {
     let v: i64 = lcg_next(seed_ptr);
     return to_f64_i64(v) * max / 2147483647.0;
 }
 
+@inline(always)
 fn lcg_next_i32(seed_ptr: ptr[i64], max: i32) -> i32 {
     let v: i64 = lcg_next(seed_ptr);
     return narrow(v % widen(max));
@@ -173,29 +228,17 @@ fn main() -> i32 {
         if ship_y < 0.0 - 13.0 { ship_y = 0.0 - 13.0; }
         if ship_y > 13.0       { ship_y = 13.0; }
 
-        // --- UPDATE ASTEROIDS ---
-        for i: i32 in range(0, num_ast) {
-            if ptr_read_i32(ast_alive, i) == 1 {
-                let ax: f64 = ptr_read_f64(ast_x, i) + ptr_read_f64(ast_vx, i);
-                let ay: f64 = ptr_read_f64(ast_y, i) + ptr_read_f64(ast_vy, i);
+        // --- UPDATE ASTEROIDS (pure hot-loop) ---
+        update_asteroids(ast_x, ast_y, ast_vx, ast_vy,
+                         ast_alive, num_ast,
+                         0.0 - 25.0, 25.0, 0.0 - 20.0, 20.0);
 
-                // Wrap around world edges
-                if ax < 0.0 - 25.0 { ax = 25.0; }
-                if ax > 25.0       { ax = 0.0 - 25.0; }
-                if ay < 0.0 - 20.0 { ay = 20.0; }
-                if ay > 20.0       { ay = 0.0 - 20.0; }
-
-                ptr_write_f64(ast_x, i, ax);
-                ptr_write_f64(ast_y, i, ay);
-
-                // --- Collision with ship ---
-                let d: f64 = distance_sq(ship_x, ship_y, ax, ay);
-                let min_dist: f64 = ship_radius + ptr_read_f64(ast_radius, i);
-                if d < min_dist * min_dist {
-                    alive = 0;
-                    play_beep(150, 500);
-                }
-            }
+        // --- CHECK COLLISIONS (pure hot-loop, read-only on arrays) ---
+        if check_collisions(ship_x, ship_y, ship_radius,
+                            ast_x, ast_y, ast_radius, ast_alive,
+                            num_ast) == 1 {
+            alive = 0;
+            play_beep(150, 500);
         }
 
         // --- SPAWN new asteroids periodically ---
