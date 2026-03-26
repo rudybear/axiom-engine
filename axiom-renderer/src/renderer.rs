@@ -150,6 +150,10 @@ pub struct Renderer {
     mesh_transforms: HashMap<u32, MeshTransform>,
     mesh_draw_queue: Vec<MeshDrawCommand>,
     next_mesh_id: u32,
+
+    // Per-frame surface texture (acquired in begin_frame, presented in end_frame)
+    current_frame_texture: Option<wgpu::SurfaceTexture>,
+    current_frame_view: Option<wgpu::TextureView>,
 }
 
 // Inline WGSL shader source
@@ -312,6 +316,10 @@ impl Renderer {
             mesh_transforms: HashMap::new(),
             mesh_draw_queue: Vec::new(),
             next_mesh_id: 1,
+
+            // Per-frame surface texture
+            current_frame_texture: None,
+            current_frame_view: None,
         })
     }
 
@@ -545,11 +553,9 @@ impl Renderer {
             return false;
         }
         self.draw_commands.clear();
-        true
-    }
 
-    /// End the current frame: execute all draw commands and present.
-    pub fn end_frame(&mut self) {
+        // Acquire the surface texture for this frame.
+        // All rendering within the frame will target this same texture.
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost) => {
@@ -557,125 +563,144 @@ impl Renderer {
                 match self.surface.get_current_texture() {
                     Ok(t) => t,
                     Err(e) => {
-                        eprintln!("[AXIOM Renderer] Surface error: {e}");
-                        return;
+                        eprintln!("[AXIOM Renderer] Surface error in begin_frame: {e}");
+                        return false;
                     }
                 }
             }
             Err(wgpu::SurfaceError::OutOfMemory) => {
                 eprintln!("[AXIOM Renderer] Out of memory!");
                 self.should_close = true;
-                return;
+                return false;
             }
             Err(e) => {
-                eprintln!("[AXIOM Renderer] Surface error: {e}");
-                return;
+                eprintln!("[AXIOM Renderer] Surface error in begin_frame: {e}");
+                return false;
             }
         };
 
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.current_frame_view = Some(view);
+        self.current_frame_texture = Some(output);
+        true
+    }
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("AXIOM Frame Encoder"),
-            });
-
-        // Determine clear color from commands (use last clear, default black)
-        let mut clear_color = wgpu::Color::BLACK;
-        for cmd in &self.draw_commands {
-            if let DrawCommand::Clear { r, g, b } = cmd {
-                clear_color = wgpu::Color {
-                    r: *r,
-                    g: *g,
-                    b: *b,
-                    a: 1.0,
-                };
-            }
+    /// End the current frame: execute all draw commands and present.
+    pub fn end_frame(&mut self) {
+        if self.current_frame_view.is_none() {
+            eprintln!("[AXIOM Renderer] end_frame called without begin_frame");
+            return;
         }
 
-        // Collect all geometry into vertex buffers
-        let mut point_vertices: Vec<Vertex> = Vec::new();
-        let mut tri_vertices: Vec<Vertex> = Vec::new();
-
-        for cmd in &self.draw_commands {
-            match cmd {
-                DrawCommand::Points(verts) => point_vertices.extend_from_slice(verts),
-                DrawCommand::Triangles(verts) => tri_vertices.extend_from_slice(verts),
-                DrawCommand::Clear { .. } => {}
-            }
-        }
-
-        // Create vertex buffers
-        let point_buf = if !point_vertices.is_empty() {
-            Some(self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("Point Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&point_vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                },
-            ))
-        } else {
-            None
-        };
-
-        let tri_buf = if !tri_vertices.is_empty() {
-            Some(self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label: Some("Triangle Vertex Buffer"),
-                    contents: bytemuck::cast_slice(&tri_vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                },
-            ))
-        } else {
-            None
-        };
-
-        // Render pass
+        // Render draw commands into the frame texture
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("AXIOM Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
+            let view = self.current_frame_view.as_ref().unwrap();
+
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("AXIOM Frame Encoder"),
+                });
+
+            // Determine clear color from commands (use last clear, default black)
+            let mut clear_color = wgpu::Color::BLACK;
+            for cmd in &self.draw_commands {
+                if let DrawCommand::Clear { r, g, b } = cmd {
+                    clear_color = wgpu::Color {
+                        r: *r,
+                        g: *g,
+                        b: *b,
+                        a: 1.0,
+                    };
+                }
+            }
+
+            // Collect all geometry into vertex buffers
+            let mut point_vertices: Vec<Vertex> = Vec::new();
+            let mut tri_vertices: Vec<Vertex> = Vec::new();
+
+            for cmd in &self.draw_commands {
+                match cmd {
+                    DrawCommand::Points(verts) => point_vertices.extend_from_slice(verts),
+                    DrawCommand::Triangles(verts) => tri_vertices.extend_from_slice(verts),
+                    DrawCommand::Clear { .. } => {}
+                }
+            }
+
+            // Create vertex buffers
+            let point_buf = if !point_vertices.is_empty() {
+                Some(self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("Point Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&point_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
                     },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            // Use the active Lux pipeline if one is bound, otherwise the built-in pipeline
-            let active_pipeline = match self.active_lux_pipeline {
-                Some(id) => self
-                    .lux_pipelines
-                    .get(&id)
-                    .map(|lp| &lp.pipeline)
-                    .unwrap_or(&self.pipeline),
-                None => &self.pipeline,
+                ))
+            } else {
+                None
             };
-            render_pass.set_pipeline(active_pipeline);
 
-            // Draw triangles (from triangle commands)
-            if let Some(buf) = &tri_buf {
-                render_pass.set_vertex_buffer(0, buf.slice(..));
-                render_pass.draw(0..tri_vertices.len() as u32, 0..1);
+            let tri_buf = if !tri_vertices.is_empty() {
+                Some(self.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("Triangle Vertex Buffer"),
+                        contents: bytemuck::cast_slice(&tri_vertices),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    },
+                ))
+            } else {
+                None
+            };
+
+            // Render pass
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("AXIOM Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(clear_color),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+
+                // Use the active Lux pipeline if one is bound, otherwise the built-in pipeline
+                let active_pipeline = match self.active_lux_pipeline {
+                    Some(id) => self
+                        .lux_pipelines
+                        .get(&id)
+                        .map(|lp| &lp.pipeline)
+                        .unwrap_or(&self.pipeline),
+                    None => &self.pipeline,
+                };
+                render_pass.set_pipeline(active_pipeline);
+
+                // Draw triangles (from triangle commands)
+                if let Some(buf) = &tri_buf {
+                    render_pass.set_vertex_buffer(0, buf.slice(..));
+                    render_pass.draw(0..tri_vertices.len() as u32, 0..1);
+                }
+
+                // Draw points (rendered as small quads — 2 triangles per point)
+                if let Some(buf) = &point_buf {
+                    render_pass.set_vertex_buffer(0, buf.slice(..));
+                    render_pass.draw(0..point_vertices.len() as u32, 0..1);
+                }
             }
 
-            // Draw points (rendered as small quads — 2 triangles per point)
-            if let Some(buf) = &point_buf {
-                render_pass.set_vertex_buffer(0, buf.slice(..));
-                render_pass.draw(0..point_vertices.len() as u32, 0..1);
-            }
+            self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        // Present the frame texture
+        self.current_frame_view = None;
+        if let Some(output) = self.current_frame_texture.take() {
+            output.present();
+        }
 
         self.frame_count += 1;
         if self.frame_count <= 3 || self.frame_count % 50 == 0 {
@@ -866,6 +891,8 @@ impl Renderer {
     /// This renders the PBR scene (if loaded) into the surface texture, copies
     /// the result to a CPU-readable buffer, converts BGRA -> RGBA, and saves
     /// a PNG using the `image` crate.
+    ///
+    /// Must be called between begin_frame() and end_frame().
     pub fn screenshot(&mut self, path: &str) -> Result<(), String> {
         self.ensure_pbr_pipeline();
         self.ensure_depth_texture();
@@ -873,9 +900,9 @@ impl Renderer {
         let width = self.surface_config.width;
         let height = self.surface_config.height;
 
-        // Get the current surface texture
-        let output = self.surface.get_current_texture().map_err(|e| format!("Surface: {e}"))?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Use the frame texture acquired in begin_frame
+        let view = self.current_frame_view.as_ref()
+            .ok_or_else(|| "screenshot called without begin_frame".to_string())?;
 
         // --- Render the scene into this texture ---
         if let (Some(scene), Some(depth_view), Some(pbr)) =
@@ -908,7 +935,7 @@ impl Renderer {
                 let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Screenshot Render Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
+                        view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -950,6 +977,10 @@ impl Renderer {
         }
 
         // --- Copy texture to CPU buffer ---
+        // Access the underlying SurfaceTexture for the copy operation
+        let surface_texture = self.current_frame_texture.as_ref()
+            .ok_or_else(|| "screenshot: no frame texture available".to_string())?;
+
         let bytes_per_pixel = 4u32;
         let padded_row_size = ((width * bytes_per_pixel + 255) / 256) * 256;
 
@@ -962,7 +993,7 @@ impl Renderer {
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
-            output.texture.as_image_copy(),
+            surface_texture.texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -1035,9 +1066,6 @@ impl Renderer {
             "[AXIOM Screenshot] Center pixel ({},{}) = rgba({}, {}, {}, {})",
             cx, cy, rgba[ci], rgba[ci+1], rgba[ci+2], rgba[ci+3]
         );
-
-        // Present the texture (so the window shows the frame)
-        output.present();
 
         image::save_buffer(path, &rgba, width, height, image::ColorType::Rgba8)
             .map_err(|e| format!("Save PNG: {e}"))?;
@@ -1387,6 +1415,14 @@ impl Renderer {
         self.ensure_pbr_pipeline();
         self.ensure_depth_texture();
 
+        let view = match self.current_frame_view.as_ref() {
+            Some(v) => v,
+            None => {
+                eprintln!("[AXIOM Renderer] render_scene_instanced called without begin_frame");
+                return;
+            }
+        };
+
         let scene = match &self.loaded_scene {
             Some(s) => s,
             None => return,
@@ -1437,29 +1473,6 @@ impl Renderer {
             },
         );
 
-        // Get surface texture
-        let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                match self.surface.get_current_texture() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("[AXIOM Renderer] Surface error in render_scene_instanced: {e}");
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[AXIOM Renderer] Surface error in render_scene_instanced: {e}");
-                return;
-            }
-        };
-
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1470,7 +1483,7 @@ impl Renderer {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("PBR Instanced Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -1510,7 +1523,6 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
     }
 
     /// Render the loaded PBR scene with the current camera.
@@ -1518,6 +1530,14 @@ impl Renderer {
     pub fn render_scene(&mut self) {
         self.ensure_pbr_pipeline();
         self.ensure_depth_texture();
+
+        let view = match self.current_frame_view.as_ref() {
+            Some(v) => v,
+            None => {
+                eprintln!("[AXIOM Renderer] render_scene called without begin_frame");
+                return;
+            }
+        };
 
         let scene = match &self.loaded_scene {
             Some(s) => s,
@@ -1552,29 +1572,6 @@ impl Renderer {
         };
         pbr.update_model(&self.queue, &identity);
 
-        // Get surface texture
-        let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                match self.surface.get_current_texture() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("[AXIOM Renderer] Surface error in render_scene: {e}");
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[AXIOM Renderer] Surface error in render_scene: {e}");
-                return;
-            }
-        };
-
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1586,7 +1583,7 @@ impl Renderer {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("PBR Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -1628,7 +1625,6 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
     }
 
     /// Begin frame with timing support.
@@ -1644,6 +1640,12 @@ impl Renderer {
             self.flush_mesh_draws();
         }
 
+        // Present the frame texture acquired in begin_frame
+        self.current_frame_view = None;
+        if let Some(output) = self.current_frame_texture.take() {
+            output.present();
+        }
+
         if let Some(start) = self.frame_start.take() {
             self.last_frame_time = start.elapsed().as_secs_f64();
         }
@@ -1654,6 +1656,15 @@ impl Renderer {
     fn flush_mesh_draws(&mut self) {
         self.ensure_pbr_pipeline();
         self.ensure_depth_texture();
+
+        let view = match self.current_frame_view.as_ref() {
+            Some(v) => v,
+            None => {
+                eprintln!("[AXIOM Renderer] flush_mesh_draws: no frame texture (missing begin_frame?)");
+                self.mesh_draw_queue.clear();
+                return;
+            }
+        };
 
         let depth_view = match &self.depth_view {
             Some(v) => v,
@@ -1670,92 +1681,70 @@ impl Renderer {
         pbr.update_camera(&self.queue, &camera_uniform);
         pbr.update_lights(&self.queue, &self.lights);
 
-        // Get surface texture
-        let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Lost) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                match self.surface.get_current_texture() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        eprintln!("[AXIOM Renderer] Surface error in flush_mesh_draws: {e}");
-                        self.mesh_draw_queue.clear();
-                        return;
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("[AXIOM Renderer] Surface error in flush_mesh_draws: {e}");
-                self.mesh_draw_queue.clear();
-                return;
-            }
-        };
+        // Draw each mesh in its own submit cycle so we can update the model
+        // uniform buffer between draws (wgpu doesn't allow buffer writes during
+        // an active render pass).
+        let draw_cmds: Vec<MeshDrawCommand> = self.mesh_draw_queue.drain(..).collect();
+        let pbr = self.pbr_pipeline.as_ref().unwrap();
 
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        for (i, cmd) in draw_cmds.iter().enumerate() {
+            let mesh = match self.procedural_meshes.iter().find(|m| m.id == cmd.mesh_id) {
+                Some(m) => m,
+                None => continue,
+            };
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            // Update model matrix BEFORE the render pass
+            let model_uniform = Self::build_model_uniform(&cmd.transform);
+            self.queue.write_buffer(
+                &pbr.model_buffer,
+                0,
+                bytemuck::bytes_of(&model_uniform),
+            );
+
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Mesh Draw Encoder"),
             });
 
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Mesh Draw Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02, g: 0.02, b: 0.05, a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            let pbr = self.pbr_pipeline.as_ref().unwrap();
-            render_pass.set_pipeline(&pbr.pipeline);
-            render_pass.set_bind_group(0, &pbr.camera_bind_group, &[]);
-            render_pass.set_bind_group(1, &pbr.default_material_bind_group, &[]);
-
-            // Draw each queued mesh
-            for cmd in &self.mesh_draw_queue {
-                // Find the mesh
-                let mesh = match self.procedural_meshes.iter().find(|m| m.id == cmd.mesh_id) {
-                    Some(m) => m,
-                    None => continue,
+            {
+                // First draw clears, subsequent draws load (preserve previous draws)
+                let load_op = if i == 0 {
+                    wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 })
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                let depth_load = if i == 0 {
+                    wgpu::LoadOp::Clear(1.0)
+                } else {
+                    wgpu::LoadOp::Load
                 };
 
-                // Update model matrix
-                let model_uniform = Self::build_model_uniform(&cmd.transform);
-                self.queue.write_buffer(
-                    &pbr.model_buffer,
-                    0,
-                    bytemuck::bytes_of(&model_uniform),
-                );
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Mesh Draw Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: load_op, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: depth_view,
+                        depth_ops: Some(wgpu::Operations { load: depth_load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
 
+                render_pass.set_pipeline(&pbr.pipeline);
+                render_pass.set_bind_group(0, &pbr.camera_bind_group, &[]);
+                render_pass.set_bind_group(1, &pbr.default_material_bind_group, &[]);
                 render_pass.set_bind_group(2, &pbr.model_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                 render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
             }
-        }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
 
         self.mesh_draw_queue.clear();
     }
